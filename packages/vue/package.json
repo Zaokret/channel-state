@@ -50,7 +50,7 @@
   ],
   "scripts": {
     "build": "tsup",
-    "dev": "tsup src/index.ts",
+    "dev": "tsup src/index.ts --watch",
     "format": "prettier --write . --config ../../.prettierrc.json",
     "lint": "eslint . --fix",
     "lint:check": "eslint .",
