@@ -18,7 +18,7 @@
 
 ## 📖 Overview
 
-`@channel-state/core` is the foundational package of the `channel-state` ecosystem. It provides the `ChannelStore` class, a powerful, zero-dependency solution for state management that works in any JavaScript environment. It enables seamless, real-time state synchronization across browser tabs and windows using the native `BroadcastChannel` and `IndexedDB` APIs.
+`@channel-state/core` is the foundational package of the `channel-state` ecosystem. It provides the `ChannelStore` class, a powerful, small-dependency solution for state management that works in any JavaScript environment. It enables seamless, real-time state synchronization across browser tabs and windows using the native `BroadcastChannel` and `IndexedDB` APIs.
 
 ## 🛠️ Installation
 

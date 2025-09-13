@@ -14,22 +14,25 @@
  * limitations under the License.
  */
 
+import { createPatch, applyPatch, Operation } from 'rfc6902'
+
 /**
  * Represents the types of messages that can be sent between stores.
  * - 'REQUEST_INIT_STATE': A request from a new store instance asking for the current state.
  * - 'RESPONSE_INIT_STATE': A response from an existing store, providing its state to the new instance.
  * - 'STATE_UPDATE': A regular state update broadcast to all other stores.
+ * - 'STATE_PATCH': A patch instruction from a changed store to all other stores.
  */
 export type StoreBroadcastMessageType =
   | 'REQUEST_INIT_STATE'
   | 'RESPONSE_INIT_STATE'
   | 'STATE_UPDATE'
+  | 'STATE_PATCH'
 
 /**
  * Represents a message sent between stores.
- * @template T The type of the payload.
- * @remarks This interface is used for both sending and receiving messages between stores.
- **/
+ * @template T The type of the payload (state or patch array).
+ */
 export interface StoreBroadcastMessage<T> {
   type: StoreBroadcastMessageType
   senderId: string
@@ -78,7 +81,8 @@ export interface ChannelStoreOptions<T> {
 
 /**
  * A class that manages and shares state across different browser tabs or windows
- * using BroadcastChannel and IndexedDB for persistence.
+ * using BroadcastChannel and IndexedDB for persistence, with JSON Patch (RFC 6902)
+ * for non-primitive state updates and full state for primitives.
  * @template T The type of the state managed by the store.
  *
  * @property {StoreStatus} status The current status of the store, indicating its readiness and lifecycle phase.
@@ -124,6 +128,20 @@ export class ChannelStore<T> {
     } else {
       this._requestInitialStateFromOtherTabs()
     }
+  }
+
+  /**
+   * Checks if a value is a primitive type (string, number, boolean, null, undefined, symbol).
+   */
+  private _isPrimitive(value: any): boolean {
+    return (
+      value === null ||
+      typeof value === 'undefined' ||
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean' ||
+      typeof value === 'symbol'
+    )
   }
 
   private _initDB() {
@@ -186,6 +204,7 @@ export class ChannelStore<T> {
     this._channel.postMessage({
       type: 'REQUEST_INIT_STATE',
       senderId: this._instanceId,
+      payload: null,
     })
 
     this._initialStateRequestTimeout = setTimeout(() => {
@@ -209,7 +228,7 @@ export class ChannelStore<T> {
    * @private
    */
   private _handleChannelMessage = (
-    messageEvent: MessageEvent<StoreBroadcastMessage<T>>,
+    messageEvent: MessageEvent<StoreBroadcastMessage<T | Operation[]>>,
   ) => {
     if (this.status === 'destroyed') {
       return
@@ -237,7 +256,7 @@ export class ChannelStore<T> {
             clearTimeout(this._initialStateRequestTimeout)
             this._initialStateRequestTimeout = null
           }
-          this._value = message.payload
+          this._value = message.payload as T
           this.status = 'ready'
           this._notifySubscribers()
           this._notifyStatusSubscribers()
@@ -247,8 +266,26 @@ export class ChannelStore<T> {
       case 'STATE_UPDATE':
         // Only accept this if we are already ready
         if (this.status === 'ready') {
-          this._value = message.payload
+          this._value = message.payload as T
           this._notifySubscribers()
+        }
+        break
+
+      case 'STATE_PATCH':
+        if (this.status === 'ready') {
+          const patch = message.payload as Operation[]
+          try {
+            const result = applyPatch(this._value, patch)
+            if (result.some((op) => op === null)) {
+              console.error('Failed to apply patch: Invalid operation')
+              this._requestInitialStateFromOtherTabs()
+            } else {
+              this._notifySubscribers()
+            }
+          } catch (error) {
+            console.error('Failed to apply patch:', error)
+            this._requestInitialStateFromOtherTabs()
+          }
         }
         break
     }
@@ -270,18 +307,23 @@ export class ChannelStore<T> {
     })
   }
 
-  /**
-   * Triggers a change notification by posting the current cache to the BroadcastChannel
-   * and notifying local subscribers.
-   * @private
-   */
-  private _triggerChange() {
+  private _broadcastPatch(patch: Operation[]) {
     if (this.status === 'destroyed') {
       return
     }
     this._channel.postMessage({
+      type: 'STATE_PATCH',
+      payload: patch,
+      senderId: this._instanceId,
+    })
+    this._notifySubscribers()
+  }
+
+  private _broadcastFullState(value: T) {
+    if (this.status === 'destroyed') return
+    this._channel.postMessage({
       type: 'STATE_UPDATE',
-      payload: this._value,
+      payload: value,
       senderId: this._instanceId,
     })
     this._notifySubscribers()
@@ -295,55 +337,62 @@ export class ChannelStore<T> {
     return this._value
   }
 
-  /**
-   * Sets a new value for the store's state.
-   *
-   * This method updates the value, broadcasts the change to other tabs, and
-   * persists the new value to IndexedDB if persistence is enabled.
-   *
-   * If `set()` is called while the store is still `initializing`, it will
-   * immediately transition the store to the `ready` state with the new value,
-   * cancelling any pending initial state synchronization.
-   *
-   * @param value The new state value to set.
-   */
   set(value: T): void {
-    if (this.status === 'destroyed') {
-      return
-    }
+    if (this.status === 'destroyed') return
 
     if (this.status === 'initializing') {
       this.status = 'ready'
       this._notifyStatusSubscribers()
     }
 
-    this._value = value
-
-    if (!this._persist || this._db === null) {
-      this._triggerChange()
-      return
-    }
-
-    void new Promise<void>((resolve, reject) => {
-      const db = this._db
-
-      if (!db) {
-        reject(new Error('Database not initialized'))
+    if (this._isPrimitive(value)) {
+      // For primitives, update full state
+      this._value = value
+      if (!this._persist || this._db === null) {
+        this._broadcastFullState(value)
         return
       }
 
-      const tx = db.transaction(this._prefixedName, 'readwrite')
-      const store = tx.objectStore(this._prefixedName)
-      const req = store.put(value, this._dbKey)
+      this._updateDatabase(value).then(
+        () => {
+          this._broadcastFullState(value)
+        },
+        (err: unknown) => {
+          if (err instanceof Error) {
+            console.error('Error caught:', err.message)
+          } else {
+            console.error('Unknown error:', err)
+          }
+        },
+      )
+      return
+    }
 
-      req.onsuccess = () => {
-        this._triggerChange()
-        resolve()
-      }
-      req.onerror = () => {
-        reject(new Error(req.error?.message ?? 'unknown error'))
-      }
-    })
+    // For non-primitives, compute and broadcast patch
+    const oldValue = structuredClone(this._value)
+    const patch = createPatch(oldValue, value)
+    if (patch.length === 0) return // No changes
+
+    this._value = value
+
+    if (!this._persist || this._db === null) {
+      this._broadcastPatch(patch)
+      return
+    }
+
+    this._updateDatabase(value).then(
+      () => {
+        this._broadcastPatch(patch)
+      },
+      (err: unknown) => {
+        if (err instanceof Error) {
+          console.error('Error caught:', err.message)
+        } else {
+          console.error('Unknown error:', err)
+        }
+      },
+    )
+    return
   }
 
   /**
@@ -356,7 +405,6 @@ export class ChannelStore<T> {
       throw new Error('ChannelStore is destroyed')
     }
     this._subscribers.add(callback)
-
     return () => {
       this._subscribers.delete(callback)
     }
@@ -372,7 +420,6 @@ export class ChannelStore<T> {
       throw new Error('ChannelStore is destroyed')
     }
     this._statusSubscribers.add(callback)
-
     return () => {
       this._statusSubscribers.delete(callback)
     }
@@ -402,17 +449,20 @@ export class ChannelStore<T> {
    * Resets the store's state to its initial value.
    * @returns A Promise that resolves when the state has been reset.
    */
-  reset(): Promise<void> {
-    if (this.status === 'destroyed') {
-      return Promise.resolve()
-    }
+  async reset(): Promise<void> {
+    if (this.status === 'destroyed') return Promise.resolve()
     this._value = structuredClone(this._initial)
-
     if (!this._db) {
-      this._triggerChange()
+      this._broadcastFullState(this._initial)
       return Promise.resolve()
     }
 
+    await this._updateDatabase(this._initial)
+    this._broadcastFullState(this._initial)
+    return
+  }
+
+  private _updateDatabase(value: T): Promise<void> {
     return new Promise((resolve, reject) => {
       const db = this._db
 
@@ -423,10 +473,9 @@ export class ChannelStore<T> {
 
       const tx = db.transaction(this._prefixedName, 'readwrite')
       const store = tx.objectStore(this._prefixedName)
-      const req = store.put(this._initial, this._dbKey)
+      const req = store.put(value, this._dbKey)
 
       req.onsuccess = () => {
-        this._triggerChange()
         resolve()
       }
       req.onerror = () => {

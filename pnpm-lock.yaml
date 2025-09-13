@@ -183,7 +183,11 @@ importers:
         specifier: ^2.0.11
         version: 2.2.12(typescript@5.8.3)
 
-  packages/core: {}
+  packages/core:
+    dependencies:
+      rfc6902:
+        specifier: ^5.1.2
+        version: 5.1.2
 
   packages/react:
     devDependencies:
@@ -2305,6 +2309,9 @@ packages:
   reusify@1.1.0:
     resolution: {integrity: sha512-g6QUff04oZpHs0eG5p83rFLhHeV00ug/Yf9nZM6fLeUrPguBTkTQOdpAWWspMh55TZfVQDPaN3NQJfbVRAxdIw==}
     engines: {iojs: '>=1.0.0', node: '>=0.10.0'}
+
+  rfc6902@5.1.2:
+    resolution: {integrity: sha512-zxcb+PWlE8PwX0tiKE6zP97THQ8/lHmeiwucRrJ3YFupWEmp25RmFSlB1dNTqjkovwqG4iq+u1gzJMBS3um8mA==}
 
   rfdc@1.4.1:
     resolution: {integrity: sha512-q1b3N5QkRUWUl7iyylaaj3kOpIT0N2i9MqIEQXP73GVsN9cw3fdx8X63cEmWhJGi2PPCF23Ijp7ktmd39rawIA==}
@@ -4961,6 +4968,8 @@ snapshots:
       signal-exit: 4.1.0
 
   reusify@1.1.0: {}
+
+  rfc6902@5.1.2: {}
 
   rfdc@1.4.1: {}
 
