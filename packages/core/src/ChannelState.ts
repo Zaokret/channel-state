@@ -77,6 +77,11 @@ export interface ChannelStoreOptions<T> {
    * @remarks Required.
    */
   initial: T
+  /**
+   * Delay in milliseconds for debouncing broadcasts to other tabs.
+   * @remarks Defaults to 0ms.
+   */
+  debounceDelay?: number
 }
 
 /**
@@ -90,6 +95,10 @@ export interface ChannelStoreOptions<T> {
 export class ChannelStore<T> {
   private _db: IDBDatabase | null = null
   private _subscribers = new Set<StoreChangeCallback<T>>()
+  private _subscriberInstanceMap = new Map<
+    string,
+    Set<StoreChangeCallback<T>>
+  >()
   private _statusSubscribers = new Set<StoreStatusCallback>()
   private _value: T
   private readonly _name: string
@@ -101,6 +110,9 @@ export class ChannelStore<T> {
   private _instanceId: string
   private _initialStateRequestTimeout: ReturnType<typeof setTimeout> | null =
     null
+  private _debounceTimeout: ReturnType<typeof setTimeout> | null = null
+  private _preDebounceState: T | null = null
+  private readonly _debounceDelay: number
 
   /**
    * The current status of the store.
@@ -116,6 +128,7 @@ export class ChannelStore<T> {
     this._persist = options.persist ?? false
     this._initial = options.initial
     this._prefixedName = `channel-state__${this._name}`
+    this._debounceDelay = options.debounceDelay ?? 0
     this._instanceId = crypto.randomUUID()
 
     this._value = structuredClone(this._initial)
@@ -248,7 +261,6 @@ export class ChannelStore<T> {
           senderId: this._instanceId,
         })
         break
-
       case 'RESPONSE_INIT_STATE':
         // Only accept this if we are still initializing
         if (this.status === 'initializing') {
@@ -262,7 +274,6 @@ export class ChannelStore<T> {
           this._notifyStatusSubscribers()
         }
         break
-
       case 'STATE_UPDATE':
         // Only accept this if we are already ready
         if (this.status === 'ready') {
@@ -270,7 +281,6 @@ export class ChannelStore<T> {
           this._notifySubscribers()
         }
         break
-
       case 'STATE_PATCH':
         if (this.status === 'ready') {
           const patch = message.payload as Operation[]
@@ -291,6 +301,13 @@ export class ChannelStore<T> {
     }
   }
 
+  private _notifyLocalSubscribers() {
+    Array.from(
+      this._subscriberInstanceMap.get(this._instanceId)?.values() ?? [],
+    ).forEach((subscriber) => {
+      subscriber(this._value)
+    })
+  }
   /**
    * Notifies all registered subscribers about a change in the store's state.
    * @private
@@ -305,6 +322,30 @@ export class ChannelStore<T> {
     this._statusSubscribers.forEach((subscriber) => {
       subscriber(this.status)
     })
+  }
+
+  private _debounceBroadcast() {
+    if (this.status === 'destroyed') {
+      return
+    }
+    if (this._debounceTimeout) {
+      clearTimeout(this._debounceTimeout)
+      this._debounceTimeout = null
+    }
+
+    this._debounceTimeout = setTimeout(() => {
+      if (this._isPrimitive(this._value)) {
+        this._broadcastFullState(this._value)
+      } else {
+        const patch = createPatch(this._preDebounceState, this._value)
+        if (patch.length > 0) {
+          this._broadcastPatch(patch)
+        }
+      }
+      clearTimeout(this._debounceTimeout ?? undefined)
+      this._debounceTimeout = null
+      this._preDebounceState = null
+    }, this._debounceDelay)
   }
 
   private _broadcastPatch(patch: Operation[]) {
@@ -345,17 +386,23 @@ export class ChannelStore<T> {
       this._notifyStatusSubscribers()
     }
 
+    if (!this._debounceTimeout) {
+      this._preDebounceState = structuredClone(this._value)
+    }
+
     if (this._isPrimitive(value)) {
       // For primitives, update full state
+
       this._value = value
+      this._notifyLocalSubscribers()
       if (!this._persist || this._db === null) {
-        this._broadcastFullState(value)
+        this._debounceBroadcast()
         return
       }
 
       this._updateDatabase(value).then(
         () => {
-          this._broadcastFullState(value)
+          this._debounceBroadcast()
         },
         (err: unknown) => {
           if (err instanceof Error) {
@@ -365,34 +412,33 @@ export class ChannelStore<T> {
           }
         },
       )
-      return
+    } else {
+      const oldValue = structuredClone(this._value)
+      const patch = createPatch(oldValue, value)
+      if (patch.length === 0) {
+        return
+      }
+
+      this._value = value
+      this._notifyLocalSubscribers()
+      if (!this._persist || this._db === null) {
+        this._debounceBroadcast()
+        return
+      }
+
+      this._updateDatabase(value).then(
+        () => {
+          this._debounceBroadcast()
+        },
+        (err: unknown) => {
+          if (err instanceof Error) {
+            console.error('Error caught:', err.message)
+          } else {
+            console.error('Unknown error:', err)
+          }
+        },
+      )
     }
-
-    // For non-primitives, compute and broadcast patch
-    const oldValue = structuredClone(this._value)
-    const patch = createPatch(oldValue, value)
-    if (patch.length === 0) return // No changes
-
-    this._value = value
-
-    if (!this._persist || this._db === null) {
-      this._broadcastPatch(patch)
-      return
-    }
-
-    this._updateDatabase(value).then(
-      () => {
-        this._broadcastPatch(patch)
-      },
-      (err: unknown) => {
-        if (err instanceof Error) {
-          console.error('Error caught:', err.message)
-        } else {
-          console.error('Unknown error:', err)
-        }
-      },
-    )
-    return
   }
 
   /**
@@ -404,8 +450,10 @@ export class ChannelStore<T> {
     if (this.status === 'destroyed') {
       throw new Error('ChannelStore is destroyed')
     }
+    this._subscriberInstanceMap.set(this._instanceId, new Set([callback]))
     this._subscribers.add(callback)
     return () => {
+      this._subscriberInstanceMap.get(this._instanceId)?.delete(callback)
       this._subscribers.delete(callback)
     }
   }
