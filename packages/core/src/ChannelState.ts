@@ -276,7 +276,7 @@ export class ChannelStore<T> {
           const patch = message.payload as Operation[]
           try {
             const result = applyPatch(this._value, patch)
-            if (result.some((op) => op === null)) {
+            if (result.some((op) => op !== null)) {
               console.error('Failed to apply patch: Invalid operation')
               this._requestInitialStateFromOtherTabs()
             } else {
